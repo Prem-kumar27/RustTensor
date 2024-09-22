@@ -1,0 +1,14 @@
+[package]
+name = "RustTensor"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "rust_tensor"
+path = "src/lib.rs"
+
+[dependencies]
+enum_dispatch = "0.3.13"
+rand_distr = "0.4.3"
+rand = "0.8.5"
+approx = "0.5.1"
