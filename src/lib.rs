@@ -3,6 +3,8 @@ use rand::distributions::Distribution;
 use rand_distr::Normal;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::error::Error;
+use std::fmt;
 use std::rc::Rc;
 
 fn compute_strides(shape: &[usize]) -> Vec<usize> {
@@ -48,7 +50,7 @@ impl From<Vec<usize>> for Shape {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct Storage {
     data: Rc<RefCell<Vec<f32>>>,
 }
@@ -84,13 +86,13 @@ pub trait BinaryFn {
 }
 
 #[enum_dispatch(UnaryFn)]
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum UnaryOp {
     Neg(Neg),
 }
 
 #[enum_dispatch(BinaryFn)]
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum BinaryOp {
     Add(Add),
     Mul(Mul),
@@ -98,7 +100,7 @@ pub enum BinaryOp {
     Div(Div),
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum Op {
     Unary(UnaryOp, Rc<Tensor>),
     Binary(BinaryOp, Rc<Tensor>, Rc<Tensor>),
@@ -110,30 +112,49 @@ pub struct GradientStore {
     grads: RefCell<HashMap<TensorId, Tensor>>,
 }
 
-impl GradientStore {
-    pub fn new() -> Self {
-        Self::default()
+pub struct GradStore(HashMap<TensorId, Tensor>);
+
+impl GradStore {
+    fn new() -> Self {
+        GradStore(HashMap::new())
     }
 
-    pub fn set_grad(&self, id: TensorId, grad: Tensor) {
-        self.grads.borrow_mut().insert(id, grad);
+    pub fn get(&self, id: TensorId) -> Option<&Tensor> {
+        self.0.get(&id)
     }
 
-    pub fn get_grad(&self, id: TensorId) -> Option<Tensor> {
-        self.grads.borrow().get(&id).cloned()
+    pub fn remove(&mut self, id: TensorId) -> Option<Tensor> {
+        self.0.remove(&id)
+    }
+
+    pub fn insert(&mut self, id: TensorId, grad: Tensor) -> Option<Tensor> {
+        self.0.insert(id, grad)
+    }
+
+    fn or_insert(&mut self, id: TensorId, shape: &[usize]) -> &mut Tensor {
+        use std::collections::hash_map::Entry;
+        match self.0.entry(id) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => {
+                let grad = Tensor::zeros(shape);
+                entry.insert(grad)
+            }
+        }
+    }
+
+    pub fn get_ids(&self) -> impl Iterator<Item = &TensorId> {
+        self.0.keys()
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Tensor {
-    id: TensorId,
+    pub id: TensorId,
     storage: Storage,
     shape: Shape,
     stride: Vec<usize>,
     requires_grad: bool,
-    grad: RefCell<Option<Rc<Tensor>>>,
     grad_fn: Option<Rc<Op>>,
-    offset: usize,
 }
 
 impl Tensor {
@@ -149,9 +170,7 @@ impl Tensor {
             shape,
             stride,
             requires_grad: false,
-            grad: RefCell::new(None),
             grad_fn: None,
-            offset: 0,
         }
     }
 
@@ -164,6 +183,10 @@ impl Tensor {
         let shape = Shape::from(shape.to_vec());
         let size = shape.elem_count();
         Self::new(vec![0.0; size], shape.to_vec())
+    }
+
+    pub fn zeros_like(&self) -> Tensor {
+        Tensor::zeros(self.shape.dims())
     }
 
     pub fn ones(shape: &[usize]) -> Self {
@@ -199,13 +222,11 @@ impl Tensor {
             shape: result.shape,
             stride: result.stride,
             requires_grad: self.requires_grad,
-            grad: RefCell::new(None),
             grad_fn: if self.requires_grad {
                 Some(Rc::new(Op::Unary(op, Rc::new(self.clone()))))
             } else {
                 None
             },
-            offset: result.offset,
         }
     }
 
@@ -223,7 +244,6 @@ impl Tensor {
             shape: result.shape,
             stride: result.stride,
             requires_grad,
-            grad: RefCell::new(None),
             grad_fn: if requires_grad {
                 Some(Rc::new(Op::Binary(
                     op,
@@ -233,7 +253,6 @@ impl Tensor {
             } else {
                 None
             },
-            offset: result.offset,
         }
     }
 
@@ -269,67 +288,87 @@ impl Tensor {
         }
     }
 
-    pub fn backward(&self) {
+    pub fn backward(&self) -> Result<GradStore, Box<dyn Error>> {
         let mut nodes = Vec::new();
         let mut visited = HashSet::new();
         self.topological_sort(&mut nodes, &mut visited);
-        let mut grads = HashMap::new();
+        let mut grads = GradStore::new();
         grads.insert(self.id, Tensor::ones(self.shape.dims()));
+
         for node in nodes.into_iter().rev() {
-            let grad = grads.get(&node.id).unwrap().clone();
+            let grad = grads.get(node.id).unwrap().clone();
 
             if let Some(ref grad_fn) = node.grad_fn {
                 match &**grad_fn {
                     Op::Unary(ref op, ref x) => {
                         let grad_x = op.backward(&grad, x);
-                        accumulate_grad(&mut grads, x.id, grad_x);
+                        accumulate_grad(&mut grads, x, &grad_x);
                     }
                     Op::Binary(ref op, ref x, ref y) => {
                         let (grad_x, grad_y) = op.backward(&grad, x, y);
-                        accumulate_grad(&mut grads, x.id, grad_x);
-                        accumulate_grad(&mut grads, y.id, grad_y);
+                        accumulate_grad(&mut grads, x, &grad_x);
+                        accumulate_grad(&mut grads, y, &grad_y);
                     }
                     _ => {}
                 }
             }
-
-            if node.requires_grad {
-                *node.grad.borrow_mut() = Some(Rc::new(grad));
-            }
         }
+        Ok(grads)
     }
 
     pub fn data(&self) -> Vec<f32> {
-        let mut data = Vec::with_capacity(self.shape.elem_count());
-        for idx in 0..self.shape.elem_count() {
-            let index = self.offset + idx;
-            data.push(self.storage.data.borrow()[index]);
-        }
-        data
+        self.storage.data.borrow().clone()
     }
 
     pub fn shape(&self) -> &[usize] {
         self.shape.dims()
     }
 
-    pub fn grad(&self) -> Option<Vec<f32>> {
-        self.grad.borrow().as_ref().map(|g| g.data())
+    pub fn to_vec1<T: From<f32>>(&self) -> Result<Vec<T>, Box<dyn std::error::Error>> {
+        Ok(self.data().into_iter().map(T::from).collect())
     }
 }
 
-fn accumulate_grad(grads: &mut HashMap<TensorId, Tensor>, id: TensorId, grad: Tensor) {
-    grads
-        .entry(id)
-        .and_modify(|g| {
-            let data: Vec<f32> = g
-                .data()
-                .iter()
-                .zip(grad.data().iter())
-                .map(|(&a, &b)| a + b)
-                .collect();
-            *g = Tensor::new(data, g.shape().to_vec());
-        })
-        .or_insert(grad);
+impl fmt::Display for Tensor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let data = self.data();
+        let shape = self.shape();
+
+        writeln!(f, "Tensor shape: {:?}", shape)?;
+        writeln!(f, "Data:")?;
+
+        if shape.len() == 1 {
+            write!(f, "[")?;
+            for (i, &val) in data.iter().enumerate() {
+                if i > 0 {
+                    write!(f, ", ")?;
+                }
+                write!(f, "{:.4}", val)?;
+            }
+            writeln!(f, "]")?;
+        } else if shape.len() == 2 {
+            let (rows, cols) = (shape[0], shape[1]);
+            for i in 0..rows {
+                write!(f, "[")?;
+                for j in 0..cols {
+                    if j > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{:.4}", data[i * cols + j])?;
+                }
+                writeln!(f, "]")?;
+            }
+        } else {
+            writeln!(f, "{:?}", data)?;
+        }
+
+        Ok(())
+    }
+}
+
+fn accumulate_grad(grads: &mut GradStore, tensor: &Tensor, grad: &Tensor) {
+    let acc_grad = grads.or_insert(tensor.id, tensor.shape());
+    *acc_grad = acc_grad.add(grad);
 }
 
 fn broadcast_shapes(shape1: &[usize], shape2: &[usize]) -> Vec<usize> {
@@ -417,8 +456,8 @@ where
 
     for idx in 0..total_size {
         let multi_idx = unflatten_index(idx, output_shape);
-        let x_idx = ravel_index_broadcast(&multi_idx, &x_broadcast_strides) + x.offset;
-        let y_idx = ravel_index_broadcast(&multi_idx, &y_broadcast_strides) + y.offset;
+        let x_idx = ravel_index_broadcast(&multi_idx, &x_broadcast_strides);
+        let y_idx = ravel_index_broadcast(&multi_idx, &y_broadcast_strides);
         let x_val = x.storage.get(x_idx);
         let y_val = y.storage.get(y_idx);
         result.push(op(x_val, y_val));
@@ -467,7 +506,7 @@ fn sum_over_axes(data: &[f32], shape: &[usize], axes: &[usize]) -> Vec<f32> {
     result
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Neg;
 
 impl UnaryFn for Neg {
@@ -481,7 +520,7 @@ impl UnaryFn for Neg {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Add;
 
 impl BinaryFn for Add {
@@ -498,7 +537,7 @@ impl BinaryFn for Add {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Sub;
 
 impl BinaryFn for Sub {
@@ -515,7 +554,7 @@ impl BinaryFn for Sub {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Mul;
 
 impl BinaryFn for Mul {
@@ -526,8 +565,8 @@ impl BinaryFn for Mul {
     }
 
     fn backward(&self, grad: &Tensor, x: &Tensor, y: &Tensor) -> (Tensor, Tensor) {
-        let grad_x = grad.mul(x);
-        let grad_y = grad.mul(y);
+        let grad_x = grad.mul(y);
+        let grad_y = grad.mul(x);
 
         let grad_x = reduce_grad(&grad_x, &grad_x.shape.dims(), x.shape());
         let grad_y = reduce_grad(&grad_y, &grad_y.shape.dims(), y.shape());
@@ -535,7 +574,7 @@ impl BinaryFn for Mul {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Div;
 
 impl BinaryFn for Div {
